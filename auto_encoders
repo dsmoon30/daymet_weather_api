@@ -1,0 +1,121 @@
+from keras.layers import Input, Dense, Dropout
+from keras.models import Model
+from keras import regularizers
+from keras.optimizers import  Adam
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA, KernelPCA
+import seaborn as sns
+
+
+# Reading the training pickle file
+dt = pd.read_pickle('F:/final_dt_2019.pkl')
+# yday should be excluded from weather.py since this is a fixed value
+ydays = dt.filter(regex='yday').columns
+w_columns = [c for c in dt.columns if c not in ydays and c not in ['zip', 'min_prcp', '50P_dayl', '10P_prcp']]
+train = dt[w_columns]
+z=pd.DataFrame(train)
+z.to_csv('F:/train.csv')
+# Make sure there is no Null value in the data
+nullcount = train.isnull().sum()[train.isnull().sum() > 0]
+train.describe()
+
+#######################################################################################
+# PCA
+sc = StandardScaler()
+stand_dt = sc.fit_transform(train)
+linear_pca = PCA(n_components=15) # 97% variance
+
+sklearn_transf = pd.DataFrame(linear_pca.fit_transform(stand_dt))
+sklearn_transf.columns = ['pc' + str(i) for i in range(1, 16)]
+final_pcs = pd.concat([ pd.DataFrame(dt.zip), sklearn_transf], 1)
+
+
+# The eigenvalues represent the variance in the direction of the eigenvector.
+# can get them through the pca.explained_variance_ attribute:
+
+explained_variance = linear_pca.explained_variance_ratio_
+var = np.cumsum(np.round(explained_variance, decimals=3) * 100)
+
+# Plot the cumulative variance explained by # of features
+plt.rc('grid', linestyle="dashed", color='grey')
+plt.ylabel('% Variance Explained')
+plt.xlabel('# of Features')
+plt.title('PCA Analysis')
+plt.ylim(50, 101)
+plt.yticks(range(50, 100, 5))
+plt.xlim(0, 20)
+plt.style.context('dark_background')
+plt.xticks(range(1, 21))
+plt.grid()
+plt.plot(var)
+
+
+df_str = final_pcs.to_csv()
+#######################################################################################
+# non linear PCA
+kpca = KernelPCA(kernel="rbf", fit_inverse_transform=True, gamma=10,  n_components=15)
+stand_dt_kpca = kpca.fit_transform(stand_dt)
+
+explained_variance = np.var(stand_dt_kpca, axis=0)
+explained_variance_ratio = explained_variance / np.sum(explained_variance)
+np.cumsum(explained_variance_ratio)
+
+kpc_dt = pd.DataFrame(stand_dt_kpca)
+kpc_dt.columns = ['kpc' + str(i) for i in range(1,16)]
+final_kpc_dt = pd.concat([pd.DataFrame(dt.zip), kpc_dt], 1)
+
+
+df_str = final_kpc_dt.to_csv()
+#######################################################################################
+# To use the denoised/reconstructed feature, I will directly use autoencoder.predict( X_feat ) to extract features.
+# reduce to 20 features with non linear activation:  loss after 100 epochs = 1.4448e-04
+
+scaler = MinMaxScaler()
+nn_dt = scaler.fit_transform(train)
+
+encoding_dim = 15
+input_df = Input(shape=(nn_dt.shape[1],))
+encoded1 = Dense(64, activation='relu')(input_df)
+encoded2 = Dense(32, activation='relu')(encoded1)
+#drop1 = Dropout(0.4)(layer1)
+encoded3 = Dense(15, activation='relu')(encoded2)
+decoded1 = Dense(64, activation='relu')(encoded3)
+decoded2 = Dense(train.shape[1], activation='linear')(decoded1)
+
+# this model maps an input to its reconstruction
+autoencoder = Model(input_df, decoded2)
+
+# intermediate result
+encoder = Model(input_df, encoded3)
+ADAM = Adam(lr=0.001)
+autoencoder.compile(optimizer=ADAM, loss='mse')
+history = autoencoder.fit(  nn_dt, nn_dt,
+                epochs=100,
+                validation_split=0.2,
+                batch_size=256,
+                shuffle=True)
+
+# summarize history for loss
+plt.plot(history.history['loss'])
+plt.plot(history.history['val_loss'])
+plt.title('model loss')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['train', 'validation'], loc='upper left')
+plt.show()
+
+encoded_X_train = encoder.predict(nn_dt)
+type(encoded_X_train)
+
+encoder_dt = pd.DataFrame(encoded_X_train)
+encoder_dt.columns = ['var' + str(i) for i in range(1,16)]
+final_encoder_dt = pd.concat([pd.DataFrame(dt.zip), encoder_dt], 1)
+
+# drop columns with small variance
+dr = list(final_encoder_dt.std()[final_encoder_dt.std() < 0.01].index)
+final_encoder_dt = final_encoder_dt[[i for i in final_encoder_dt.columns if i not in dr]]
+
+df_str = final_encoder_dt.to_csv()
