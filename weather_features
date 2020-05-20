@@ -1,0 +1,120 @@
+import pandas as pd
+import numpy as np
+import daymetpy
+import sys
+import matplotlib.pyplot as plt
+import shapefile as shp #to read the shapefile
+from shapely.geometry import shape #conversion to Geometry
+import threading
+import pickle
+import queue
+
+# download 2018 us zip shapefile and find the centroids
+usazip = shp.Reader("F:/tl_2019_us_zcta510/tl_2019_us_zcta510")
+
+latlist = []
+longlist=[]
+# Calculating Centroids
+for feature in usazip.shapeRecords():
+    geom = feature.shape.__geo_interface__
+    shp_geom = shape(geom)
+    latlist.append(shp_geom.centroid.x)
+    longlist.append(shp_geom.centroid.y)
+
+zips = [d[0] for d in usazip.records()]
+latlon = dict(zip(zips, zip(latlist,longlist)))
+
+
+def dcal (degreedays):
+    hotdays = len(degreedays[degreedays>0])
+    colddays = len(degreedays)-hotdays
+    return [hotdays,colddays]
+
+###########################################################
+
+
+def daymet_data():
+    import daymetpy
+    import threading
+    import queue
+
+    max_nbr_trials = 5
+    nthreads= 70
+    threads = []
+    print_freq = 10
+
+    #############################
+    gc_queue = queue.Queue()
+    daymet_lst =[]
+    degreedaysls= []
+    def daymet_downloader(zc, lat, lon, approx_lev=.0):
+        dlat, dlon = np.random.normal(size=2) * approx_lev
+        ts = daymetpy.daymet_timeseries(lon=lon+dlon, lat=lat+dlat, start_year=2014, end_year=2019).drop(columns='year')
+
+        if ts.shape[0] > 0:
+            #ts['zipcode'] = zip
+            mintempf = (ts['tmin'] * 1.8) + 32
+            maxtempf = (ts['tmax'] * 1.8) + 32
+            mn = (mintempf + maxtempf) / 2
+            degreedays = mn - 65
+            ts['degreedays'] = degreedays
+            desc = ts.describe().T[['mean', 'std', 'min', 'max']].reset_index().rename(columns={'index': 'var'})
+            quants = ts.quantile(np.linspace(.1, 1, 9, 0)).T.reset_index().rename(columns={
+                'index': 'var',
+                0.1: '10P',
+                0.2: '20P',
+                0.30000000000000004: '30P',
+                0.4: '40P',
+                0.5: '50P',
+                0.6: '60P',
+                0.7000000000000001: '70P',
+                0.8: '80P',
+                0.9: '90P'})
+            stat = pd.merge(desc, quants, how='left', on='var')
+            stat['zip'] = zc
+            # stat.reset_index()
+            stat.set_index('zip', inplace=True)
+            daymet_lst.append(stat)
+            degreecoldhot = dcal(ts['degreedays'])
+            degreedaysls.append(degreecoldhot)
+
+    def daymet_sampler():
+        while True:
+            ix, cnt, zc_lat_lon = gc_queue.get()
+            if ix%print_freq==0:
+                print(ix, cnt, zc_lat_lon)
+            gc_queue.task_done()
+            if zc_lat_lon is None: break
+            try:
+                if cnt>0:
+                    daymet_downloader(zc=zc_lat_lon[0], lat=zc_lat_lon[1], lon=zc_lat_lon[2], approx_lev=.0)
+                else:
+                    daymet_downloader(zc=zc_lat_lon[0], lat=zc_lat_lon[1], lon=zc_lat_lon[2], approx_lev=.0050)
+            except Exception as e:
+                if cnt>-50:
+                    gc_queue.put((ix, cnt-1, zc_lat_lon))
+                else:
+                    print(e)
+
+
+    for _ in range(nthreads):
+        th = threading.Thread(target=daymet_sampler)  # , args=(varname,))
+        th.start()
+        threads.append(th)
+
+    for ix,(zc, (lon,lat)) in enumerate(latlon.items()):
+        gc_queue.put((ix, max_nbr_trials, (zc, lat, lon)))
+    gc_queue.join()
+
+    for i in range(len(threads)): gc_queue.put((i,0,None))
+    for th in threads: th.join()
+
+    appended_data = pd.concat(daymet_lst).reset_index() #.rename(columns={'index': 'zipcode'})
+    allstats = appended_data.pivot(index='zip', columns='var', values=list(appended_data.columns[2:]))
+    allstats.columns = allstats.columns.map('_'.join)
+    allstats = allstats.reset_index()
+    degreedaystbl = pd.DataFrame(degreedaysls, columns=['degreehotdays', 'degreecolddays'])
+    
+    final_dt = pd.concat([allstats, degreedaystbl], axis=1)
+    final_dt.head()
+    final_dt.to_pickle('F:/final_dt_2019.pkl')
